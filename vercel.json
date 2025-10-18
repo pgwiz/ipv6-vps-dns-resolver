@@ -4,12 +4,22 @@
     {
       "src": "ip6res.sh",
       "use": "@vercel/static"
+    },
+    {
+      "src": "adddomain.sh",
+      "use": "@vercel/static"
     }
+
+    
   ],
   "routes": [
     {
       "src": "/",
       "dest": "/ip6res.sh"
+    },
+    {
+      "src": "/dom",
+      "dest": "/adddomain.sh"
     }
   ]
 }
