@@ -1,24 +1,4 @@
-# Renew Let's Encrypt certificates
-renew_certificates() {
-    echo -e "\n${BLUE}=== Renew Let's Encrypt Certificates ===${NC}\n"
-    
-    if ! command -v certbot &> /dev/null; then
-        echo -e "${RED}Certbot is not installed${NC}"
-        return
-    fi
-    
-    echo -e "${YELLOW}Checking for certificates that need renewal...${NC}\n"
-    
-    certbot renew --quiet
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ Certificate renewal check complete${NC}"
-        systemctl reload nginx 2>/dev/null
-    else
-        echo -e "${RED}✗ Certificate renewal failed${NC}"
-        echo "Run 'certbot renew' manually for more details"
-    fi
-}#!/bin/bash
+#!/bin/bash
 
 # Cloudflare + Nginx Domain Manager
 # Supports IPv4 and IPv6, Multiple Domains
@@ -34,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Check root
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EEID" -ne 0 ]; then 
     echo -e "${RED}Please run as root (use sudo)${NC}"
     exit 1
 fi
@@ -49,7 +29,7 @@ get_server_ips() {
 install_dependencies() {
     echo -e "${GREEN}Installing dependencies...${NC}"
     apt-get update
-    apt-get install -y nginx openssl certbot python3-certbot-nginx
+    apt-get install -y nginx openssl certbot python3-certbot-nginx dnsutils
     
     # Generate snakeoil cert if missing
     if [ ! -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]; then
@@ -307,7 +287,7 @@ EOF
         [ "$ADD_WWW" = "y" ] && [ -n "$IPV6_ADDR" ] && echo -e "   ${GREEN}AAAA${NC} record: www.$DOMAIN → $IPV6_ADDR"
         echo -e "2. Enable Cloudflare Proxy (orange cloud icon)"
         echo -e "3. Set SSL/TLS mode to 'Full' or 'Full (Strict)'"
-        echo -e "4. Optional: Install Cloudflare Origin Certificate (use option 3 in menu)"
+        echo -e "4. Optional: Install SSL Certificate (use option 3 in menu)"
         echo -e "\n${GREEN}Web root:${NC} /var/www/$DOMAIN"
         echo -e "${GREEN}Config:${NC} /etc/nginx/sites-available/$DOMAIN\n"
     else
@@ -369,6 +349,11 @@ remove_domain() {
     rm -f /etc/ssl/cloudflare/${DOMAIN}.pem
     rm -f /etc/ssl/cloudflare/${DOMAIN}.key
     
+    # Remove Let's Encrypt cert if exists
+    if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+        certbot delete --cert-name "$DOMAIN" 2>/dev/null
+    fi
+    
     # Remove web files
     if [ "$REMOVE_FILES" = "y" ] || [ "$REMOVE_FILES" = "Y" ]; then
         rm -rf /var/www/$DOMAIN
@@ -384,7 +369,7 @@ remove_domain() {
     fi
 }
 
-# Install Cloudflare Origin Certificate
+# Install SSL Certificate (submenu)
 install_cf_cert() {
     echo -e "\n${BLUE}=== SSL Certificate Installation ===${NC}\n"
     
@@ -403,6 +388,7 @@ install_cf_cert() {
     esac
 }
 
+# Install Cloudflare Origin Certificate
 install_cloudflare_cert() {
     echo -e "\n${BLUE}=== Install Cloudflare Origin Certificate ===${NC}\n"
     
@@ -470,6 +456,7 @@ install_cloudflare_cert() {
     fi
 }
 
+# Install Let's Encrypt Certificate
 install_letsencrypt_cert() {
     echo -e "\n${BLUE}=== Let's Encrypt Certificate ===${NC}\n"
     
@@ -597,6 +584,28 @@ install_letsencrypt_cert() {
     fi
 }
 
+# Renew Let's Encrypt certificates
+renew_certificates() {
+    echo -e "\n${BLUE}=== Renew Let's Encrypt Certificates ===${NC}\n"
+    
+    if ! command -v certbot &> /dev/null; then
+        echo -e "${RED}Certbot is not installed${NC}"
+        return
+    fi
+    
+    echo -e "${YELLOW}Checking for certificates that need renewal...${NC}\n"
+    
+    certbot renew --quiet
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ Certificate renewal check complete${NC}"
+        systemctl reload nginx 2>/dev/null
+    else
+        echo -e "${RED}✗ Certificate renewal failed${NC}"
+        echo "Run 'certbot renew' manually for more details"
+    fi
+}
+
 # List domains
 list_domains() {
     echo -e "\n${BLUE}=== Configured Domains ===${NC}\n"
@@ -621,6 +630,9 @@ list_domains() {
         
         if [ -f "/etc/ssl/cloudflare/${domain_name}.pem" ]; then
             echo -e "${GREEN}SSL:${NC} ✓ Cloudflare Origin Certificate"
+        elif [ -f "/etc/letsencrypt/live/${domain_name}/fullchain.pem" ]; then
+            expiry=$(openssl x509 -in "/etc/letsencrypt/live/${domain_name}/fullchain.pem" -noout -enddate | cut -d= -f2)
+            echo -e "${GREEN}SSL:${NC} ✓ Let's Encrypt (expires: $expiry)"
         else
             echo -e "${YELLOW}SSL:${NC} ⚠ Default Certificate"
         fi
@@ -684,7 +696,7 @@ main() {
     
     while true; do
         show_menu
-        read -p "Select an option [0-7]: " choice
+        read -p "Select an option [0-8]: " choice
         
         case $choice in
             1) add_domain ;;
