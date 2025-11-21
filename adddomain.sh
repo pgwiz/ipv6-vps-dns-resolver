@@ -35,11 +35,13 @@ install_dependencies() {
     if [ ! -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]; then
         echo -e "${YELLOW}Generating default SSL certificate...${NC}"
         mkdir -p /etc/ssl/private /etc/ssl/certs
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
             -keyout /etc/ssl/private/ssl-cert-snakeoil.key \
             -out /etc/ssl/certs/ssl-cert-snakeoil.pem \
             -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
         chmod 600 /etc/ssl/private/ssl-cert-snakeoil.key
+        chmod 644 /etc/ssl/certs/ssl-cert-snakeoil.pem
+        echo -e "${GREEN}✓ Default SSL certificate created${NC}"
     fi
     
     systemctl enable nginx
@@ -300,14 +302,36 @@ remove_domain() {
     
     # List existing domains
     echo -e "${YELLOW}Configured domains:${NC}"
-    ls /etc/nginx/sites-available/ | grep -v default | nl
+    domains=($(ls /etc/nginx/sites-available/ | grep -v default))
+    
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo -e "${RED}No domains configured${NC}\n"
+        return
+    fi
+    
+    for i in "${!domains[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
+    done
     
     echo ""
-    read -p "Enter domain name to remove: " DOMAIN
+    read -p "Enter domain name or number: " INPUT
     
-    if [ -z "$DOMAIN" ]; then
-        echo -e "${RED}Domain cannot be empty${NC}"
+    if [ -z "$INPUT" ]; then
+        echo -e "${RED}Input cannot be empty${NC}"
         return
+    fi
+    
+    # Check if input is a number
+    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+        index=$((INPUT-1))
+        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
+            DOMAIN="${domains[$index]}"
+        else
+            echo -e "${RED}Invalid number!${NC}"
+            return
+        fi
+    else
+        DOMAIN="$INPUT"
     fi
     
     if [ ! -f /etc/nginx/sites-available/$DOMAIN ]; then
