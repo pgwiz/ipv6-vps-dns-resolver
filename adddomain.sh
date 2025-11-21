@@ -1,4 +1,24 @@
-#!/bin/bash
+# Renew Let's Encrypt certificates
+renew_certificates() {
+    echo -e "\n${BLUE}=== Renew Let's Encrypt Certificates ===${NC}\n"
+    
+    if ! command -v certbot &> /dev/null; then
+        echo -e "${RED}Certbot is not installed${NC}"
+        return
+    fi
+    
+    echo -e "${YELLOW}Checking for certificates that need renewal...${NC}\n"
+    
+    certbot renew --quiet
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ Certificate renewal check complete${NC}"
+        systemctl reload nginx 2>/dev/null
+    else
+        echo -e "${RED}✗ Certificate renewal failed${NC}"
+        echo "Run 'certbot renew' manually for more details"
+    fi
+}#!/bin/bash
 
 # Cloudflare + Nginx Domain Manager
 # Supports IPv4 and IPv6, Multiple Domains
@@ -29,7 +49,7 @@ get_server_ips() {
 install_dependencies() {
     echo -e "${GREEN}Installing dependencies...${NC}"
     apt-get update
-    apt-get install -y nginx openssl
+    apt-get install -y nginx openssl certbot python3-certbot-nginx
     
     # Generate snakeoil cert if missing
     if [ ! -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]; then
@@ -366,6 +386,24 @@ remove_domain() {
 
 # Install Cloudflare Origin Certificate
 install_cf_cert() {
+    echo -e "\n${BLUE}=== SSL Certificate Installation ===${NC}\n"
+    
+    echo "Select certificate type:"
+    echo "  1. Cloudflare Origin Certificate (manual)"
+    echo "  2. Let's Encrypt (automatic via certbot)"
+    echo "  0. Back"
+    echo ""
+    read -p "Choose option: " cert_type
+    
+    case $cert_type in
+        1) install_cloudflare_cert ;;
+        2) install_letsencrypt_cert ;;
+        0) return ;;
+        *) echo -e "${RED}Invalid option${NC}" ;;
+    esac
+}
+
+install_cloudflare_cert() {
     echo -e "\n${BLUE}=== Install Cloudflare Origin Certificate ===${NC}\n"
     
     # List domains
@@ -432,6 +470,133 @@ install_cf_cert() {
     fi
 }
 
+install_letsencrypt_cert() {
+    echo -e "\n${BLUE}=== Let's Encrypt Certificate ===${NC}\n"
+    
+    # List domains
+    domains=($(ls /etc/nginx/sites-available/ | grep -v default))
+    
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo -e "${RED}No domains configured${NC}\n"
+        return
+    fi
+    
+    echo -e "${YELLOW}Available domains:${NC}"
+    for i in "${!domains[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
+    done
+    
+    echo ""
+    read -p "Enter domain name or number: " INPUT
+    
+    if [ -z "$INPUT" ]; then
+        echo -e "${RED}Input cannot be empty${NC}"
+        return
+    fi
+    
+    # Check if input is a number
+    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+        index=$((INPUT-1))
+        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
+            DOMAIN="${domains[$index]}"
+        else
+            echo -e "${RED}Invalid number!${NC}"
+            return
+        fi
+    else
+        DOMAIN="$INPUT"
+    fi
+    
+    if [ ! -f /etc/nginx/sites-available/$DOMAIN ]; then
+        echo -e "${RED}Domain $DOMAIN not found!${NC}"
+        return
+    fi
+    
+    echo -e "${GREEN}Selected domain:${NC} $DOMAIN\n"
+    
+    # Get email
+    read -p "Enter email for Let's Encrypt notifications: " EMAIL
+    if [ -z "$EMAIL" ]; then
+        EMAIL="admin@$DOMAIN"
+        echo -e "${YELLOW}Using default email: $EMAIL${NC}"
+    fi
+    
+    # Verify DNS
+    echo -e "\n${YELLOW}Verifying DNS configuration...${NC}"
+    get_server_ips
+    
+    # Check A record (IPv4)
+    if [ -n "$IPV4_ADDR" ]; then
+        domain_ipv4=$(dig +short A "$DOMAIN" @8.8.8.8 | tail -n1)
+        if [ "$domain_ipv4" = "$IPV4_ADDR" ]; then
+            echo -e "${GREEN}✓ IPv4 DNS verified: $DOMAIN → $IPV4_ADDR${NC}"
+        else
+            echo -e "${YELLOW}⚠ IPv4 DNS: $DOMAIN → $domain_ipv4 (Server: $IPV4_ADDR)${NC}"
+        fi
+    fi
+    
+    # Check AAAA record (IPv6)
+    if [ -n "$IPV6_ADDR" ]; then
+        domain_ipv6=$(dig +short AAAA "$DOMAIN" @8.8.8.8 | tail -n1)
+        if [ "$domain_ipv6" = "$IPV6_ADDR" ]; then
+            echo -e "${GREEN}✓ IPv6 DNS verified: $DOMAIN → $IPV6_ADDR${NC}"
+        else
+            echo -e "${YELLOW}⚠ IPv6 DNS: $DOMAIN → $domain_ipv6 (Server: $IPV6_ADDR)${NC}"
+        fi
+    fi
+    
+    echo ""
+    read -p "Continue with certificate issuance? (y/n): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo -e "${YELLOW}Certificate issuance cancelled${NC}"
+        return
+    fi
+    
+    # Check certbot availability
+    if ! command -v certbot &> /dev/null; then
+        echo -e "${YELLOW}Certbot not found. Installing...${NC}"
+        apt-get update
+        apt-get install -y certbot python3-certbot-nginx
+    fi
+    
+    echo -e "\n${YELLOW}Issuing certificate via certbot...${NC}\n"
+    
+    # Run certbot
+    certbot --nginx -d "$DOMAIN" \
+        --email "$EMAIL" \
+        --agree-tos \
+        --non-interactive \
+        --redirect
+    
+    if [ $? -eq 0 ]; then
+        echo -e "\n${GREEN}✓ Let's Encrypt certificate installed successfully!${NC}"
+        
+        # Show certificate info
+        if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+            local expiry=$(openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -enddate | cut -d= -f2)
+            echo -e "${GREEN}Certificate expires:${NC} $expiry"
+        fi
+        
+        # Setup auto-renewal if not already configured
+        if ! systemctl is-active --quiet certbot.timer 2>/dev/null; then
+            echo -e "\n${YELLOW}Setting up automatic renewal...${NC}"
+            systemctl enable certbot.timer 2>/dev/null
+            systemctl start certbot.timer 2>/dev/null
+            echo -e "${GREEN}✓ Auto-renewal enabled${NC}"
+        fi
+        
+    else
+        echo -e "\n${RED}✗ Certificate issuance failed${NC}"
+        echo -e "\n${YELLOW}Common issues:${NC}"
+        echo "1. DNS not pointing to this server"
+        echo "2. Port 80/443 not accessible"
+        echo "3. Firewall blocking connections"
+        echo "4. Domain not resolving properly"
+        echo ""
+        echo "Check nginx error log: tail /var/log/nginx/error.log"
+    fi
+}
+
 # List domains
 list_domains() {
     echo -e "\n${BLUE}=== Configured Domains ===${NC}\n"
@@ -495,11 +660,12 @@ show_menu() {
     echo -e "${YELLOW}Available Actions:${NC}\n"
     echo -e "  ${GREEN}1.${NC} Add New Domain"
     echo -e "  ${GREEN}2.${NC} Remove Domain"
-    echo -e "  ${GREEN}3.${NC} Install Cloudflare Origin Certificate"
+    echo -e "  ${GREEN}3.${NC} Install SSL Certificate (Cloudflare/Let's Encrypt)"
     echo -e "  ${GREEN}4.${NC} List All Domains"
-    echo -e "  ${GREEN}5.${NC} Install/Update Dependencies"
-    echo -e "  ${GREEN}6.${NC} Restart Nginx"
-    echo -e "  ${GREEN}7.${NC} View Nginx Error Log"
+    echo -e "  ${GREEN}5.${NC} Renew Let's Encrypt Certificates"
+    echo -e "  ${GREEN}6.${NC} Install/Update Dependencies"
+    echo -e "  ${GREEN}7.${NC} Restart Nginx"
+    echo -e "  ${GREEN}8.${NC} View Nginx Error Log"
     echo -e "  ${RED}0.${NC} Exit\n"
 }
 
@@ -525,13 +691,14 @@ main() {
             2) remove_domain ;;
             3) install_cf_cert ;;
             4) list_domains ;;
-            5) install_dependencies ;;
-            6) 
+            5) renew_certificates ;;
+            6) install_dependencies ;;
+            7) 
                 echo -e "\n${YELLOW}Restarting Nginx...${NC}"
                 systemctl restart nginx
                 echo -e "${GREEN}✓ Nginx restarted${NC}\n"
                 ;;
-            7)
+            8)
                 echo -e "\n${BLUE}=== Last 30 lines of Nginx Error Log ===${NC}\n"
                 tail -30 /var/log/nginx/error.log
                 echo ""
