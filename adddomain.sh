@@ -369,20 +369,49 @@ install_cf_cert() {
     echo -e "\n${BLUE}=== Install Cloudflare Origin Certificate ===${NC}\n"
     
     # List domains
+    domains=($(ls /etc/nginx/sites-available/ | grep -v default))
+    
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo -e "${RED}No domains configured${NC}\n"
+        return
+    fi
+    
     echo -e "${YELLOW}Available domains:${NC}"
-    ls /etc/nginx/sites-available/ | grep -v default | nl
+    for i in "${!domains[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
+    done
     
     echo ""
-    read -p "Enter domain name: " DOMAIN
+    read -p "Enter domain name or number: " INPUT
+    
+    if [ -z "$INPUT" ]; then
+        echo -e "${RED}Input cannot be empty${NC}"
+        return
+    fi
+    
+    # Check if input is a number
+    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+        index=$((INPUT-1))
+        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
+            DOMAIN="${domains[$index]}"
+        else
+            echo -e "${RED}Invalid number!${NC}"
+            return
+        fi
+    else
+        DOMAIN="$INPUT"
+    fi
     
     if [ ! -f /etc/nginx/sites-available/$DOMAIN ]; then
         echo -e "${RED}Domain $DOMAIN not found!${NC}"
         return
     fi
     
+    echo -e "${GREEN}Selected domain:${NC} $DOMAIN\n"
+    
     mkdir -p /etc/ssl/cloudflare
     
-    echo -e "\n${YELLOW}Paste your Cloudflare Origin Certificate (press Ctrl+D when done):${NC}"
+    echo -e "${YELLOW}Paste your Cloudflare Origin Certificate (press Ctrl+D when done):${NC}"
     cat > /etc/ssl/cloudflare/${DOMAIN}.pem
     
     echo -e "\n${YELLOW}Paste your Private Key (press Ctrl+D when done):${NC}"
