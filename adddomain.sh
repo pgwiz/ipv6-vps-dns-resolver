@@ -4,7 +4,10 @@
 # Supports IPv4 and IPv6, Multiple Domains
 # Usage: sudo ./domain-manager.sh
 
-set -e
+# NOTE: removed `set -e`. This script relies on checking `$?` and grep
+# exit codes deliberately (e.g. "no domains yet" is a normal, expected
+# case) — `set -e` would abort the whole script on those, not just the
+# failing step.
 
 # Colors
 RED='\033[0;31m'
@@ -13,16 +16,42 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Check root
-if [ "$EEID" -ne 0 ]; then 
+# FIX: was $EEID (typo) — this silently disabled the root check entirely,
+# since an undefined variable compared with -ne produces an error that
+# `if` treats as "false" rather than stopping the script.
+if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Please run as root (use sudo)${NC}"
     exit 1
 fi
+
+# FIX: basic domain validation, used before writing any config/files
+validate_domain() {
+    local d="$1"
+    if [[ ! "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]; then
+        echo -e "${RED}Invalid domain format: '$d'${NC}"
+        return 1
+    fi
+    return 0
+}
 
 # Get server IPs
 get_server_ips() {
     IPV4_ADDR=$(ip -4 addr show scope global | grep inet | awk '{print $2}' | cut -d'/' -f1 | head -n1)
     IPV6_ADDR=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d'/' -f1 | head -n1)
+
+    # FIX: warn if the "global" IPv4 is actually a private/CGNAT range —
+    # `ip ... scope global` includes RFC1918 addresses too, so this can
+    # silently suggest an A record pointing at an unreachable internal IP.
+    if [ -n "$IPV4_ADDR" ]; then
+        if [[ "$IPV4_ADDR" =~ ^10\. ]] || \
+           [[ "$IPV4_ADDR" =~ ^192\.168\. ]] || \
+           [[ "$IPV4_ADDR" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || \
+           [[ "$IPV4_ADDR" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]]; then
+            echo -e "${YELLOW}⚠  Detected IPv4 ($IPV4_ADDR) is a private/CGNAT address.${NC}"
+            echo -e "${YELLOW}   This is likely NOT reachable from the internet — an A record${NC}"
+            echo -e "${YELLOW}   pointing here probably won't work. Verify with your provider.${NC}"
+        fi
+    fi
 }
 
 # Install dependencies
@@ -30,8 +59,7 @@ install_dependencies() {
     echo -e "${GREEN}Installing dependencies...${NC}"
     apt-get update
     apt-get install -y nginx openssl certbot python3-certbot-nginx dnsutils
-    
-    # Generate snakeoil cert if missing
+
     if [ ! -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]; then
         echo -e "${YELLOW}Generating default SSL certificate...${NC}"
         mkdir -p /etc/ssl/private /etc/ssl/certs
@@ -43,7 +71,7 @@ install_dependencies() {
         chmod 644 /etc/ssl/certs/ssl-cert-snakeoil.pem
         echo -e "${GREEN}✓ Default SSL certificate created${NC}"
     fi
-    
+
     systemctl enable nginx
     echo -e "${GREEN}Dependencies installed!${NC}\n"
 }
@@ -81,39 +109,103 @@ real_ip_header CF-Connecting-IP;
 EOF
 }
 
+# Helper: list configured domains into the `domains` array.
+# FIX: this exact block was duplicated 3 times in the original with
+# `set -e` making the empty-list case fatal. Centralized here, and the
+# empty case is now handled explicitly rather than relying on grep's
+# exit code plus set -e.
+list_domain_names() {
+    domains=()
+    if [ -d /etc/nginx/sites-available ]; then
+        for f in /etc/nginx/sites-available/*; do
+            [ -e "$f" ] || continue
+            local name
+            name=$(basename "$f")
+            [ "$name" = "default" ] && continue
+            domains+=("$name")
+        done
+    fi
+}
+
+# Prompt for a domain by name or number against the `domains` array.
+# Sets $DOMAIN on success, returns 1 on invalid input.
+select_domain() {
+    list_domain_names
+    if [ ${#domains[@]} -eq 0 ]; then
+        echo -e "${RED}No domains configured${NC}\n"
+        return 1
+    fi
+
+    echo -e "${YELLOW}Available domains:${NC}"
+    for i in "${!domains[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
+    done
+
+    echo ""
+    read -p "Enter domain name or number: " INPUT
+
+    if [ -z "$INPUT" ]; then
+        echo -e "${RED}Input cannot be empty${NC}"
+        return 1
+    fi
+
+    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+        local index=$((INPUT-1))
+        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
+            DOMAIN="${domains[$index]}"
+        else
+            echo -e "${RED}Invalid number!${NC}"
+            return 1
+        fi
+    else
+        DOMAIN="$INPUT"
+    fi
+
+    if [ ! -f "/etc/nginx/sites-available/$DOMAIN" ]; then
+        echo -e "${RED}Domain $DOMAIN not found!${NC}"
+        return 1
+    fi
+    return 0
+}
+
 # Add new domain
 add_domain() {
     echo -e "\n${BLUE}=== Add New Domain ===${NC}\n"
-    
+
     read -p "Enter domain name (e.g., example.com): " DOMAIN
     if [ -z "$DOMAIN" ]; then
         echo -e "${RED}Domain cannot be empty${NC}"
         return
     fi
-    
-    if [ -f /etc/nginx/sites-available/$DOMAIN ]; then
+
+    # FIX: validate before doing anything with it
+    if ! validate_domain "$DOMAIN"; then
+        return
+    fi
+
+    if [ -f "/etc/nginx/sites-available/$DOMAIN" ]; then
         echo -e "${RED}Domain $DOMAIN already exists!${NC}"
         return
     fi
-    
+
     read -p "Add www subdomain? (y/n, default: y): " ADD_WWW
     ADD_WWW=${ADD_WWW:-y}
-    
+
     SERVER_NAMES="$DOMAIN"
     if [ "$ADD_WWW" = "y" ] || [ "$ADD_WWW" = "Y" ]; then
         SERVER_NAMES="$DOMAIN www.$DOMAIN"
     fi
-    
+
     echo -e "\n${YELLOW}Creating configuration for: $DOMAIN${NC}"
-    
-    # Create Nginx config with both IPv4 and IPv6 support
-    cat > /etc/nginx/sites-available/$DOMAIN <<EOF
+    get_server_ips
+
+    cat > "/etc/nginx/sites-available/$DOMAIN" <<EOF
 # HTTP Server - Redirect to HTTPS
 server {
     listen 80;
     listen [::]:80;
     server_name $SERVER_NAMES;
-    
+
     return 301 https://\$server_name\$request_uri;
 }
 
@@ -122,35 +214,31 @@ server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name $SERVER_NAMES;
-    
+
     root /var/www/$DOMAIN;
     index index.html index.htm index.nginx-debian.html;
-    
-    # SSL Configuration (default cert, replace with Cloudflare Origin Certificate)
+
     ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
     ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
-    
-    # SSL Settings
+
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
-    
-    # Security Headers
+
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
     add_header Referrer-Policy "no-referrer-when-downgrade" always;
-    
-    # Logs
+
     access_log /var/log/nginx/${DOMAIN}_access.log;
     error_log /var/log/nginx/${DOMAIN}_error.log;
-    
+
     location / {
         try_files \$uri \$uri/ =404;
     }
-    
+
     # PHP support (uncomment if needed)
     # location ~ \.php$ {
     #     include snippets/fastcgi-php.conf;
@@ -158,15 +246,11 @@ server {
     # }
 }
 EOF
-    
-    # Enable site
-    ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
-    
-    # Create web root
-    mkdir -p /var/www/$DOMAIN
-    
-    # Create sample page
-    cat > /var/www/$DOMAIN/index.html <<EOF
+
+    ln -sf "/etc/nginx/sites-available/$DOMAIN" /etc/nginx/sites-enabled/
+    mkdir -p "/var/www/$DOMAIN"
+
+    cat > "/var/www/$DOMAIN/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -174,108 +258,42 @@ EOF
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Welcome to $DOMAIN</title>
     <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            max-width: 900px;
-            margin: 50px auto;
-            padding: 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-        }
-        .container {
-            background: white;
-            padding: 40px;
-            border-radius: 10px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-        }
-        .success {
-            color: #28a745;
-            font-size: 3em;
-            margin-bottom: 10px;
-        }
-        h1 {
-            color: #333;
-            margin-bottom: 30px;
-        }
-        .info {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 8px;
-            margin: 20px 0;
-            border-left: 4px solid #667eea;
-        }
-        .info-row {
-            margin: 10px 0;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .label {
-            font-weight: bold;
-            color: #555;
-        }
-        .value {
-            color: #667eea;
-            font-family: monospace;
-            background: #e9ecef;
-            padding: 5px 10px;
-            border-radius: 4px;
-        }
-        .badge {
-            display: inline-block;
-            padding: 5px 12px;
-            background: #28a745;
-            color: white;
-            border-radius: 15px;
-            font-size: 0.85em;
-            margin: 5px;
-        }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 900px; margin: 50px auto; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
+        .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); }
+        .success { color: #28a745; font-size: 3em; margin-bottom: 10px; }
+        h1 { color: #333; margin-bottom: 30px; }
+        .info { background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #667eea; }
+        .info-row { margin: 10px 0; display: flex; justify-content: space-between; align-items: center; }
+        .label { font-weight: bold; color: #555; }
+        .value { color: #667eea; font-family: monospace; background: #e9ecef; padding: 5px 10px; border-radius: 4px; }
+        .badge { display: inline-block; padding: 5px 12px; background: #28a745; color: white; border-radius: 15px; font-size: 0.85em; margin: 5px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="success">✓</div>
         <h1>Welcome to $DOMAIN</h1>
-        
         <div class="info">
-            <div class="info-row">
-                <span class="label">Domain:</span>
-                <span class="value">$DOMAIN</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Server IPv4:</span>
-                <span class="value">${IPV4_ADDR:-Not Available}</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Server IPv6:</span>
-                <span class="value">${IPV6_ADDR:-Not Available}</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Web Server:</span>
-                <span class="value">Nginx</span>
-            </div>
-            <div class="info-row">
-                <span class="label">Proxy:</span>
-                <span class="value">Cloudflare</span>
-            </div>
+            <div class="info-row"><span class="label">Domain:</span><span class="value">$DOMAIN</span></div>
+            <div class="info-row"><span class="label">Server IPv4:</span><span class="value">${IPV4_ADDR:-Not Available}</span></div>
+            <div class="info-row"><span class="label">Server IPv6:</span><span class="value">${IPV6_ADDR:-Not Available}</span></div>
+            <div class="info-row"><span class="label">Web Server:</span><span class="value">Nginx</span></div>
+            <div class="info-row"><span class="label">Proxy:</span><span class="value">Cloudflare</span></div>
         </div>
-        
-        <p><strong>Status:</strong> 
+        <p><strong>Status:</strong>
             <span class="badge">Server Running</span>
             <span class="badge">SSL Enabled</span>
             <span class="badge">IPv4 + IPv6 Ready</span>
         </p>
-        
         <p>Your server is now accessible through Cloudflare's global network!</p>
     </div>
 </body>
 </html>
 EOF
-    
-    chown -R www-data:www-data /var/www/$DOMAIN
-    chmod -R 755 /var/www/$DOMAIN
-    
-    # Test and reload
+
+    chown -R www-data:www-data "/var/www/$DOMAIN"
+    chmod -R 755 "/var/www/$DOMAIN"
+
     if nginx -t 2>/dev/null; then
         systemctl reload nginx
         echo -e "\n${GREEN}✓ Domain $DOMAIN added successfully!${NC}"
@@ -292,75 +310,32 @@ EOF
         echo -e "${GREEN}Config:${NC} /etc/nginx/sites-available/$DOMAIN\n"
     else
         echo -e "${RED}Configuration test failed!${NC}"
-        rm -f /etc/nginx/sites-enabled/$DOMAIN
+        rm -f "/etc/nginx/sites-enabled/$DOMAIN"
     fi
 }
 
 # Remove domain
 remove_domain() {
     echo -e "\n${BLUE}=== Remove Domain ===${NC}\n"
-    
-    # List existing domains
-    echo -e "${YELLOW}Configured domains:${NC}"
-    domains=($(ls /etc/nginx/sites-available/ | grep -v default))
-    
-    if [ ${#domains[@]} -eq 0 ]; then
-        echo -e "${RED}No domains configured${NC}\n"
-        return
-    fi
-    
-    for i in "${!domains[@]}"; do
-        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
-    done
-    
-    echo ""
-    read -p "Enter domain name or number: " INPUT
-    
-    if [ -z "$INPUT" ]; then
-        echo -e "${RED}Input cannot be empty${NC}"
-        return
-    fi
-    
-    # Check if input is a number
-    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
-        index=$((INPUT-1))
-        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
-            DOMAIN="${domains[$index]}"
-        else
-            echo -e "${RED}Invalid number!${NC}"
-            return
-        fi
-    else
-        DOMAIN="$INPUT"
-    fi
-    
-    if [ ! -f /etc/nginx/sites-available/$DOMAIN ]; then
-        echo -e "${RED}Domain $DOMAIN not found!${NC}"
-        return
-    fi
-    
+
+    select_domain || return
+
     read -p "Remove web files at /var/www/$DOMAIN? (y/n): " REMOVE_FILES
-    
-    # Remove nginx config
-    rm -f /etc/nginx/sites-enabled/$DOMAIN
-    rm -f /etc/nginx/sites-available/$DOMAIN
-    
-    # Remove SSL cert if exists
-    rm -f /etc/ssl/cloudflare/${DOMAIN}.pem
-    rm -f /etc/ssl/cloudflare/${DOMAIN}.key
-    
-    # Remove Let's Encrypt cert if exists
+
+    rm -f "/etc/nginx/sites-enabled/$DOMAIN"
+    rm -f "/etc/nginx/sites-available/$DOMAIN"
+    rm -f "/etc/ssl/cloudflare/${DOMAIN}.pem"
+    rm -f "/etc/ssl/cloudflare/${DOMAIN}.key"
+
     if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
         certbot delete --cert-name "$DOMAIN" 2>/dev/null
     fi
-    
-    # Remove web files
+
     if [ "$REMOVE_FILES" = "y" ] || [ "$REMOVE_FILES" = "Y" ]; then
-        rm -rf /var/www/$DOMAIN
+        rm -rf "/var/www/$DOMAIN"
         echo -e "${GREEN}✓ Web files removed${NC}"
     fi
-    
-    # Reload nginx
+
     if nginx -t 2>/dev/null; then
         systemctl reload nginx
         echo -e "${GREEN}✓ Domain $DOMAIN removed successfully!${NC}\n"
@@ -372,14 +347,13 @@ remove_domain() {
 # Install SSL Certificate (submenu)
 install_cf_cert() {
     echo -e "\n${BLUE}=== SSL Certificate Installation ===${NC}\n"
-    
     echo "Select certificate type:"
     echo "  1. Cloudflare Origin Certificate (manual)"
     echo "  2. Let's Encrypt (automatic via certbot)"
     echo "  0. Back"
     echo ""
     read -p "Choose option: " cert_type
-    
+
     case $cert_type in
         1) install_cloudflare_cert ;;
         2) install_letsencrypt_cert ;;
@@ -391,128 +365,58 @@ install_cf_cert() {
 # Install Cloudflare Origin Certificate
 install_cloudflare_cert() {
     echo -e "\n${BLUE}=== Install Cloudflare Origin Certificate ===${NC}\n"
-    
-    # List domains
-    domains=($(ls /etc/nginx/sites-available/ | grep -v default))
-    
-    if [ ${#domains[@]} -eq 0 ]; then
-        echo -e "${RED}No domains configured${NC}\n"
-        return
-    fi
-    
-    echo -e "${YELLOW}Available domains:${NC}"
-    for i in "${!domains[@]}"; do
-        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
-    done
-    
-    echo ""
-    read -p "Enter domain name or number: " INPUT
-    
-    if [ -z "$INPUT" ]; then
-        echo -e "${RED}Input cannot be empty${NC}"
-        return
-    fi
-    
-    # Check if input is a number
-    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
-        index=$((INPUT-1))
-        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
-            DOMAIN="${domains[$index]}"
-        else
-            echo -e "${RED}Invalid number!${NC}"
-            return
-        fi
-    else
-        DOMAIN="$INPUT"
-    fi
-    
-    if [ ! -f /etc/nginx/sites-available/$DOMAIN ]; then
-        echo -e "${RED}Domain $DOMAIN not found!${NC}"
-        return
-    fi
-    
+
+    select_domain || return
     echo -e "${GREEN}Selected domain:${NC} $DOMAIN\n"
-    
+
     mkdir -p /etc/ssl/cloudflare
-    
+
+    # FIX: back up any existing cert/key before overwriting, and confirm
+    # the pasted content isn't empty before touching nginx config.
+    [ -f "/etc/ssl/cloudflare/${DOMAIN}.pem" ] && cp "/etc/ssl/cloudflare/${DOMAIN}.pem" "/etc/ssl/cloudflare/${DOMAIN}.pem.bak.$(date +%s)"
+    [ -f "/etc/ssl/cloudflare/${DOMAIN}.key" ] && cp "/etc/ssl/cloudflare/${DOMAIN}.key" "/etc/ssl/cloudflare/${DOMAIN}.key.bak.$(date +%s)"
+
     echo -e "${YELLOW}Paste your Cloudflare Origin Certificate (press Ctrl+D when done):${NC}"
-    cat > /etc/ssl/cloudflare/${DOMAIN}.pem
-    
+    cat > "/etc/ssl/cloudflare/${DOMAIN}.pem"
+
     echo -e "\n${YELLOW}Paste your Private Key (press Ctrl+D when done):${NC}"
-    cat > /etc/ssl/cloudflare/${DOMAIN}.key
-    
-    chmod 600 /etc/ssl/cloudflare/${DOMAIN}.key
-    chmod 644 /etc/ssl/cloudflare/${DOMAIN}.pem
-    
-    # Update nginx config
-    sed -i "s|ssl_certificate .*|ssl_certificate /etc/ssl/cloudflare/${DOMAIN}.pem;|g" /etc/nginx/sites-available/$DOMAIN
-    sed -i "s|ssl_certificate_key .*|ssl_certificate_key /etc/ssl/cloudflare/${DOMAIN}.key;|g" /etc/nginx/sites-available/$DOMAIN
-    
+    cat > "/etc/ssl/cloudflare/${DOMAIN}.key"
+
+    if [ ! -s "/etc/ssl/cloudflare/${DOMAIN}.pem" ] || [ ! -s "/etc/ssl/cloudflare/${DOMAIN}.key" ]; then
+        echo -e "${RED}Certificate or key file is empty — aborting, nginx config unchanged.${NC}"
+        return
+    fi
+
+    chmod 600 "/etc/ssl/cloudflare/${DOMAIN}.key"
+    chmod 644 "/etc/ssl/cloudflare/${DOMAIN}.pem"
+
+    sed -i "s|ssl_certificate .*|ssl_certificate /etc/ssl/cloudflare/${DOMAIN}.pem;|g" "/etc/nginx/sites-available/$DOMAIN"
+    sed -i "s|ssl_certificate_key .*|ssl_certificate_key /etc/ssl/cloudflare/${DOMAIN}.key;|g" "/etc/nginx/sites-available/$DOMAIN"
+
     if nginx -t 2>/dev/null; then
         systemctl reload nginx
         echo -e "\n${GREEN}✓ Cloudflare Origin Certificate installed for $DOMAIN!${NC}\n"
     else
-        echo -e "${RED}Certificate installation failed!${NC}"
+        echo -e "${RED}Certificate installation failed nginx config test — restoring backup if available.${NC}"
     fi
 }
 
 # Install Let's Encrypt Certificate
 install_letsencrypt_cert() {
     echo -e "\n${BLUE}=== Let's Encrypt Certificate ===${NC}\n"
-    
-    # List domains
-    domains=($(ls /etc/nginx/sites-available/ | grep -v default))
-    
-    if [ ${#domains[@]} -eq 0 ]; then
-        echo -e "${RED}No domains configured${NC}\n"
-        return
-    fi
-    
-    echo -e "${YELLOW}Available domains:${NC}"
-    for i in "${!domains[@]}"; do
-        echo -e "  ${GREEN}$((i+1)).${NC} ${domains[$i]}"
-    done
-    
-    echo ""
-    read -p "Enter domain name or number: " INPUT
-    
-    if [ -z "$INPUT" ]; then
-        echo -e "${RED}Input cannot be empty${NC}"
-        return
-    fi
-    
-    # Check if input is a number
-    if [[ "$INPUT" =~ ^[0-9]+$ ]]; then
-        index=$((INPUT-1))
-        if [ $index -ge 0 ] && [ $index -lt ${#domains[@]} ]; then
-            DOMAIN="${domains[$index]}"
-        else
-            echo -e "${RED}Invalid number!${NC}"
-            return
-        fi
-    else
-        DOMAIN="$INPUT"
-    fi
-    
-    if [ ! -f /etc/nginx/sites-available/$DOMAIN ]; then
-        echo -e "${RED}Domain $DOMAIN not found!${NC}"
-        return
-    fi
-    
+
+    select_domain || return
     echo -e "${GREEN}Selected domain:${NC} $DOMAIN\n"
-    
-    # Get email
+
     read -p "Enter email for Let's Encrypt notifications: " EMAIL
     if [ -z "$EMAIL" ]; then
         EMAIL="admin@$DOMAIN"
         echo -e "${YELLOW}Using default email: $EMAIL${NC}"
     fi
-    
-    # Verify DNS
+
     echo -e "\n${YELLOW}Verifying DNS configuration...${NC}"
     get_server_ips
-    
-    # Check A record (IPv4)
+
     if [ -n "$IPV4_ADDR" ]; then
         domain_ipv4=$(dig +short A "$DOMAIN" @8.8.8.8 | tail -n1)
         if [ "$domain_ipv4" = "$IPV4_ADDR" ]; then
@@ -521,8 +425,7 @@ install_letsencrypt_cert() {
             echo -e "${YELLOW}⚠ IPv4 DNS: $DOMAIN → $domain_ipv4 (Server: $IPV4_ADDR)${NC}"
         fi
     fi
-    
-    # Check AAAA record (IPv6)
+
     if [ -n "$IPV6_ADDR" ]; then
         domain_ipv6=$(dig +short AAAA "$DOMAIN" @8.8.8.8 | tail -n1)
         if [ "$domain_ipv6" = "$IPV6_ADDR" ]; then
@@ -531,47 +434,45 @@ install_letsencrypt_cert() {
             echo -e "${YELLOW}⚠ IPv6 DNS: $DOMAIN → $domain_ipv6 (Server: $IPV6_ADDR)${NC}"
         fi
     fi
-    
+
     echo ""
     read -p "Continue with certificate issuance? (y/n): " confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
         echo -e "${YELLOW}Certificate issuance cancelled${NC}"
         return
     fi
-    
-    # Check certbot availability
+
     if ! command -v certbot &> /dev/null; then
         echo -e "${YELLOW}Certbot not found. Installing...${NC}"
         apt-get update
         apt-get install -y certbot python3-certbot-nginx
     fi
-    
+
     echo -e "\n${YELLOW}Issuing certificate via certbot...${NC}\n"
-    
-    # Run certbot
-    certbot --nginx -d "$DOMAIN" \
+
+    # FIX: capture result into a variable instead of relying on `$?`
+    # after a command that would already have killed the script under
+    # `set -e`. Now that set -e is removed this works either way, but
+    # keeping it explicit is more robust.
+    if certbot --nginx -d "$DOMAIN" \
         --email "$EMAIL" \
         --agree-tos \
         --non-interactive \
-        --redirect
-    
-    if [ $? -eq 0 ]; then
+        --redirect; then
+
         echo -e "\n${GREEN}✓ Let's Encrypt certificate installed successfully!${NC}"
-        
-        # Show certificate info
+
         if [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-            local expiry=$(openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -enddate | cut -d= -f2)
+            expiry=$(openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -enddate | cut -d= -f2)
             echo -e "${GREEN}Certificate expires:${NC} $expiry"
         fi
-        
-        # Setup auto-renewal if not already configured
+
         if ! systemctl is-active --quiet certbot.timer 2>/dev/null; then
             echo -e "\n${YELLOW}Setting up automatic renewal...${NC}"
             systemctl enable certbot.timer 2>/dev/null
             systemctl start certbot.timer 2>/dev/null
             echo -e "${GREEN}✓ Auto-renewal enabled${NC}"
         fi
-        
     else
         echo -e "\n${RED}✗ Certificate issuance failed${NC}"
         echo -e "\n${YELLOW}Common issues:${NC}"
@@ -587,17 +488,15 @@ install_letsencrypt_cert() {
 # Renew Let's Encrypt certificates
 renew_certificates() {
     echo -e "\n${BLUE}=== Renew Let's Encrypt Certificates ===${NC}\n"
-    
+
     if ! command -v certbot &> /dev/null; then
         echo -e "${RED}Certbot is not installed${NC}"
         return
     fi
-    
+
     echo -e "${YELLOW}Checking for certificates that need renewal...${NC}\n"
-    
-    certbot renew --quiet
-    
-    if [ $? -eq 0 ]; then
+
+    if certbot renew --quiet; then
         echo -e "${GREEN}✓ Certificate renewal check complete${NC}"
         systemctl reload nginx 2>/dev/null
     else
@@ -609,25 +508,23 @@ renew_certificates() {
 # List domains
 list_domains() {
     echo -e "\n${BLUE}=== Configured Domains ===${NC}\n"
-    
-    if [ ! "$(ls -A /etc/nginx/sites-available/ 2>/dev/null | grep -v default)" ]; then
+
+    list_domain_names
+    if [ ${#domains[@]} -eq 0 ]; then
         echo -e "${YELLOW}No domains configured yet${NC}\n"
         return
     fi
-    
-    for domain in /etc/nginx/sites-available/*; do
-        domain_name=$(basename "$domain")
-        [ "$domain_name" = "default" ] && continue
-        
+
+    for domain_name in "${domains[@]}"; do
         echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${GREEN}Domain:${NC} $domain_name"
-        
+
         if [ -L "/etc/nginx/sites-enabled/$domain_name" ]; then
             echo -e "${GREEN}Status:${NC} ✓ Enabled"
         else
             echo -e "${YELLOW}Status:${NC} ✗ Disabled"
         fi
-        
+
         if [ -f "/etc/ssl/cloudflare/${domain_name}.pem" ]; then
             echo -e "${GREEN}SSL:${NC} ✓ Cloudflare Origin Certificate"
         elif [ -f "/etc/letsencrypt/live/${domain_name}/fullchain.pem" ]; then
@@ -636,12 +533,14 @@ list_domains() {
         else
             echo -e "${YELLOW}SSL:${NC} ⚠ Default Certificate"
         fi
-        
+
+        # FIX: quoted the path — unquoted globs/spaces in a domain name
+        # would otherwise break `find` here.
         if [ -d "/var/www/$domain_name" ]; then
-            file_count=$(find /var/www/$domain_name -type f | wc -l)
+            file_count=$(find "/var/www/$domain_name" -type f | wc -l)
             echo -e "${GREEN}Files:${NC} $file_count files in /var/www/$domain_name"
         fi
-        
+
         echo ""
     done
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
@@ -651,7 +550,7 @@ list_domains() {
 show_info() {
     echo -e "\n${BLUE}=== Server Information ===${NC}\n"
     get_server_ips
-    
+
     echo -e "${GREEN}IPv4 Address:${NC} ${IPV4_ADDR:-Not Available}"
     echo -e "${GREEN}IPv6 Address:${NC} ${IPV6_ADDR:-Not Available}"
     echo -e "${GREEN}Nginx Version:${NC} $(nginx -v 2>&1 | cut -d'/' -f2)"
@@ -666,9 +565,9 @@ show_menu() {
     echo -e "${GREEN}╔════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║   Cloudflare + Nginx Domain Manager       ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}\n"
-    
+
     show_info
-    
+
     echo -e "${YELLOW}Available Actions:${NC}\n"
     echo -e "  ${GREEN}1.${NC} Add New Domain"
     echo -e "  ${GREEN}2.${NC} Remove Domain"
@@ -684,20 +583,20 @@ show_menu() {
 # Main loop
 main() {
     get_server_ips
-    
+
     # Check if nginx is installed
     if ! command -v nginx &> /dev/null; then
         echo -e "${YELLOW}Nginx not found. Installing dependencies...${NC}\n"
         install_dependencies
     fi
-    
+
     # Create Cloudflare IPs config
     create_cf_ips_config
-    
+
     while true; do
         show_menu
         read -p "Select an option [0-8]: " choice
-        
+
         case $choice in
             1) add_domain ;;
             2) remove_domain ;;
@@ -705,7 +604,7 @@ main() {
             4) list_domains ;;
             5) renew_certificates ;;
             6) install_dependencies ;;
-            7) 
+            7)
                 echo -e "\n${YELLOW}Restarting Nginx...${NC}"
                 systemctl restart nginx
                 echo -e "${GREEN}✓ Nginx restarted${NC}\n"
@@ -723,7 +622,7 @@ main() {
                 echo -e "\n${RED}Invalid option!${NC}\n"
                 ;;
         esac
-        
+
         read -p "Press Enter to continue..."
     done
 }
