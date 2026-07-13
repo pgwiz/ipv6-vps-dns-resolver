@@ -1,14 +1,18 @@
-# IP6NS Installer
+# IP6NS — IPv6 DNS64/NAT64 Toolkit
 
-![IP6NS](https://img.shields.io/badge/IP6NS-Installer-blue)
+![IP6NS](https://img.shields.io/badge/IP6NS-Toolkit-blue)
 ![Installer: auto/manual](https://img.shields.io/badge/Install-Automatic%20%7C%20Manual-yellowgreen)
 ![Security](https://img.shields.io/badge/Security-Inspect%20Before%20Run-red)
 
-A small installer for the IP6NS script hosted at: https://ip6ns.pgwiz.us.kg
+Automatic DNS64/NAT64 configuration for IPv6-only VPS instances (Scaleway, AWS, etc.), so they can reach IPv4-only sites like GitHub — plus a diagnostic menu and a Cloudflare + Nginx domain manager.
 
-This README shows two installation methods:
-- Automatic (one‑liner) using the hosted installer
-- Manual via git clone
+This repo contains three scripts:
+
+| Script | Purpose |
+|---|---|
+| `ipv6.sh` | One-shot DNS64/NAT64 setup. Disables the systemd-resolved stub, writes a static `/etc/resolv.conf` pointed at working DNS64 servers, tests against github.com, and locks the file so nothing overwrites it. |
+| `ip6res.sh` | Interactive diagnostic menu — scan current setup, test DNS64/NAT64 translation, find/apply the fastest DNS64 server, view network diagnostics, restore from backup. |
+| `adddomain.sh` | Cloudflare + Nginx domain manager — add/remove domains, install Cloudflare Origin or Let's Encrypt certificates, supports IPv4 and IPv6. |
 
 Tips to make commands easy to copy:
 - On GitHub, fenced code blocks show a "Copy" button — click it to copy the command to your clipboard.
@@ -23,155 +27,118 @@ ASCII logo (pasteable)
 ```
 
 Quick links
-- Raw installer (open in browser): https://ip6ns.pgwiz.us.kg
-- Recommended raw (HTTPS): https://ip6ns.pgwiz.us.kg
+- Repo: https://github.com/pgwiz/ipv6-vps-dns-resolver
+- Raw `ipv6.sh` (open in browser): https://pastebin.com/raw/e5jjFagF
 
 Contents
 - Quick Start (click-to-copy commands)
-- Manual Install (git clone)
+- Full Toolkit Install (git clone, all 3 scripts)
 - Safety & Verification
-- Usage, Troubleshooting & Uninstall
+- Usage & Troubleshooting
 - Contributing & License
 
 ---
 
-## Quick Start — Automatic (one‑liner)
+## Quick Start — DNS64/NAT64 only (one-liner)
 
-Recommended — use HTTPS and prefer download+inspect flow. The one‑liner below executes the installer script directly. This is convenient but risky (it runs remote code).
+If you just need working IPv4-site access on an IPv6-only box, this is all you need. Runs `ipv6.sh` directly, no clone required.
 
 Click-to-copy (single-line; GitHub shows a "Copy" button on the right of the code block):
 
 ```bash
-bash <(curl -fsSL https://ip6ns.pgwiz.us.kg)
-```
-
-Alternative (pipe to bash):
-
-```bash
-curl -fsSL https://ip6ns.pgwiz.us.kg | bash
-```
-
-If you need sudo:
-
-```bash
-sudo bash <(curl -fsSL https://ip6ns.pgwiz.us.kg)
+sudo bash <(curl -fsSL https://pastebin.com/raw/e5jjFagF)
 ```
 
 Safer workflow (download, inspect, then run):
 
 ```bash
-curl -fsSL https://ip6ns.pgwiz.us.kg -o /tmp/ip6ns-installer.sh
-less /tmp/ip6ns-installer.sh      # inspect the script
-sha256sum /tmp/ip6ns-installer.sh
-sudo bash /tmp/ip6ns-installer.sh
+curl -fsSL https://pastebin.com/raw/e5jjFagF -o /tmp/ipv6.sh
+less /tmp/ipv6.sh      # inspect the script
+sudo bash /tmp/ipv6.sh
 ```
 
-Open the raw script in your browser (clickable link):
-https://ip6ns.pgwiz.us.kg
+At the end of the run, `ipv6.sh` will offer to install the full toolkit (`ip6res.sh` + `adddomain.sh`) automatically — press `1` to install, or `0` to exit with just DNS64/NAT64 configured.
+
+Open the raw script in your browser (clickable link): https://pastebin.com/raw/e5jjFagF
 
 ---
 
-## Manual Install (git clone)
+## Full Toolkit Install (git clone, all 3 scripts)
 
-If you prefer to keep a copy under version control and inspect locally:
+If you want the diagnostic menu and domain manager as well as DNS64 setup, install everything at once:
 
 ```bash
-git clone https://github.com/<owner>/<repo>.git
-cd <repo>
-less install.sh           # inspect before running
-chmod +x install.sh
-sudo ./install.sh
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/pgwiz/ipv6-vps-dns-resolver/main/install.sh)
 ```
 
-Notes:
-- Replace https://github.com/<owner>/<repo>.git with the actual repo URL if this project is in a git repo.
-- If the installer has a different filename, substitute it.
+This will:
+1. Download all three scripts to `/opt/ip6ns` via `curl` from `raw.githubusercontent.com`.
+2. `chmod +x` all three scripts.
+3. Offer a menu to run `ipv6.sh`, `ip6res.sh`, or `adddomain.sh` immediately.
+
+**Note on `git clone` and IPv6-only boxes:** `github.com` itself has no IPv6 (AAAA) record — only `raw.githubusercontent.com` does. That means `git clone https://github.com/...` will fail on a fresh IPv6-only VPS *until* DNS64/NAT64 is already configured. `install.sh` avoids this entirely by using plain `curl` against the raw host instead of `git`, so it works standalone with zero prior setup.
+
+If you have IPv4 (or DNS64 already configured) and prefer git:
+
+```bash
+git clone https://github.com/pgwiz/ipv6-vps-dns-resolver.git
+cd ipv6-vps-dns-resolver
+less ipv6.sh              # inspect before running
+chmod +x *.sh
+sudo ./ipv6.sh
+```
 
 ---
 
-## Make commands easily pastable in README (how this file helps)
-
-- Fenced code blocks are single-line for the one‑liner installers. On GitHub and many markdown renderers, these blocks include a "Copy" button to copy the command to clipboard immediately.
-- Each command is presented as a single line (no line breaks) to ensure pasting into a terminal works without editing.
-- The raw script link is provided so users can open the script directly in a browser and copy or download it.
-
----
-
-## Security & Verification
+## Safety & Verification
 
 Running remote scripts directly is risky. Recommended steps:
 
 1. Download and inspect before running:
-   - curl -fsSL https://ip6ns.pgwiz.us.kg -o /tmp/ip6ns-installer.sh
-   - less /tmp/ip6ns-installer.sh
+   ```bash
+   curl -fsSL https://pastebin.com/raw/e5jjFagF -o /tmp/ipv6.sh
+   less /tmp/ipv6.sh
+   ```
 
-2. Verify checksum (if provided by the maintainer):
-   - curl -fsSL https://ip6ns.pgwiz.us.kg/ip6ns-installer.sha256 -o /tmp/ip6ns-installer.sha256
-   - sha256sum -c /tmp/ip6ns-installer.sha256
-   - If no checksum is available, ask the maintainer to publish one and sign it.
+2. Run in a safe environment first (VM, container) to validate behavior before using on a production box.
 
-3. Run in a safe environment first (VM, container) to validate behavior.
-
-Security checklist for maintainers (add to repo as needed):
-- Publish a signed checksum file (e.g., SHA256 + GPG signature).
-- Publish release artifacts on GitHub releases.
-- Provide an installation verification command (e.g., --version, --status).
+3. All three scripts are plain, readable bash with no obfuscation — `less` any of them before running.
 
 ---
 
 ## Usage & Verification
 
-Replace the examples below with real commands your script installs or configures.
-
-Examples you can copy:
-
 ```bash
-# Check installer version (example)
-ip6ns --version
+# Check current DNS servers in use
+grep nameserver /etc/resolv.conf
 
-# Check service status (if installed as a systemd service)
-systemctl status ip6ns.service
+# Test DNS64/NAT64 is actually working (not just configured)
+curl -6 -v https://github.com
 
-# Show installed config (example)
-cat /etc/ip6ns/config.conf
+# Re-run the diagnostic menu at any time
+sudo bash /opt/ip6ns/ip6res.sh
 ```
 
 Troubleshooting:
-- Review installer logs (if the installer writes any):
-  - /var/log/ip6ns-install.log
-- Re-run installer with verbose/debug option (if supported):
-  - sudo ./install.sh --debug
+- If `/etc/resolv.conf` is locked and you need to edit it manually: `sudo chattr -i /etc/resolv.conf`
+- If systemd-resolved keeps overriding your DNS servers, check `resolvectl status` — the stub listener must be disabled (`ipv6.sh` does this automatically via `/etc/systemd/resolved.conf.d/disable-stub.conf`).
+- Backups of the previous `/etc/resolv.conf` are kept as `/etc/resolv.conf.backup.<timestamp>`.
 
 ---
 
 ## Uninstall
 
-If the installer supports uninstall:
-
 ```bash
-sudo ./install.sh --uninstall
-```
+# Unlock and restore your original resolv.conf
+sudo chattr -i /etc/resolv.conf
+sudo cp /etc/resolv.conf.backup.<timestamp> /etc/resolv.conf
 
-If not, document the files the script creates (in the repo) and provide manual removal steps:
-- Remove binary: sudo rm /usr/local/bin/ip6ns
-- Remove config: sudo rm -rf /etc/ip6ns
-- Remove systemd unit: sudo systemctl stop ip6ns.service && sudo systemctl disable ip6ns.service && sudo rm /etc/systemd/system/ip6ns.service
+# Remove the systemd-resolved stub override
+sudo rm -f /etc/systemd/resolved.conf.d/disable-stub.conf
+sudo systemctl restart systemd-resolved
 
-(Replace with the actual files/paths your installer uses.)
-
----
-
-## Graphics & Visuals
-
-This README includes:
-- Shields.io badges at the top for visual cues
-- ASCII logo for a quick terminal-friendly visual
-- Clickable raw script link for quick browser inspection
-
-If you'd like a screenshot or SVG showing installer output, add an image file to the repo (e.g., docs/screenshot.png) and embed like:
-
-```markdown
-![Installer Output](docs/screenshot.png)
+# Remove the toolkit files
+sudo rm -rf /opt/ip6ns
 ```
 
 ---
@@ -179,22 +146,11 @@ If you'd like a screenshot or SVG showing installer output, add an image file to
 ## Contributing
 
 - Fork the repo
-- Create a branch: git checkout -b feature/your-change
+- Create a branch: `git checkout -b feature/your-change`
 - Commit, push, and open a PR with a clear description
-
-Include tests and update the README if you change install behavior.
 
 ---
 
 ## License
 
-Choose a license (e.g., MIT). Add a LICENSE file to the repo.
-
----
-
-If you want, I can:
-- Generate a ready-to-commit README.md with your repo URL and the exact script filename.
-- Add a screenshot placeholder image and an example checksum file.
-- Create a small assets folder with an SVG badge you prefer.
-
-Tell me which of the above you'd like me to produce and provide the repo URL (if you want a commit-ready file).
+MIT
